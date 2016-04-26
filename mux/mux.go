@@ -1,14 +1,16 @@
 package mux
 
 import (
-	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/yinghuocho/golibfq/utils"
 )
 
 const (
@@ -33,9 +35,9 @@ type Session struct {
 	// atomic generation Id for new Streams
 	genStreamID uint32
 
-	conn    net.Conn
-	quit    chan bool
-	writeCh chan *muxFrame
+	wlock sync.Mutex
+	conn  net.Conn
+	quit  chan bool
 
 	// mapLock protects operations on streams-map by Session.loop or someone
 	// invokes Stream.Close, or Client.OpenStream
@@ -66,20 +68,38 @@ type Stream struct {
 	// checked by Write to ensure first data from Client Stream has a SYN flag.
 	synSent bool
 
-	// inbound data is buffered, and the buffered data can be read out after closing.
-	inboundArriving  chan []byte
-	inboundDeparture chan []byte
-	inboundPending   [][]byte
-	inboundCur       []byte
+	up    *utils.BytePipe
+	upCur []byte
 
 	readDeadline  time.Time
 	writeDeadline time.Time
 
-	// quitFlag is checked to ensure quit signal only sent once.
 	quit     chan bool
 	quitFlag uint32
 
 	session *Session
+}
+
+var (
+	framePool *sync.Pool = &sync.Pool{
+		New: func() interface{} {
+			return &muxFrame{}
+		},
+	}
+)
+
+func newFrame(sID uint32, flag byte, dataLen uint16, data []byte) *muxFrame {
+	f := framePool.Get().(*muxFrame)
+	f.sID = sID
+	f.flag = flag
+	f.dataLen = dataLen
+	f.data = data
+	return f
+}
+
+func releaseFrame(f *muxFrame) {
+	f.data = nil
+	framePool.Put(f)
 }
 
 func NewClient(c net.Conn) *Client {
@@ -88,7 +108,6 @@ func NewClient(c net.Conn) *Client {
 		conn:     c,
 		streams:  make(map[uint32]*Stream),
 		quit:     make(chan bool),
-		writeCh:  make(chan *muxFrame),
 		mapLock:  &sync.Mutex{},
 		streamCh: make(chan *Stream),
 	}
@@ -115,7 +134,6 @@ func NewServer(c net.Conn) *Server {
 		conn:     c,
 		streams:  make(map[uint32]*Stream),
 		quit:     make(chan bool),
-		writeCh:  make(chan *muxFrame),
 		mapLock:  &sync.Mutex{},
 		streamCh: make(chan *Stream),
 	}
@@ -139,44 +157,39 @@ func (s *Server) SetIdleTime(idle time.Duration) {
 	s.s.idle = idle
 }
 
-func (s *Session) readFrame() (frame muxFrame, err error) {
+func (s *Session) readFrame() (*muxFrame, error) {
 	var buf [7]byte
-	_, err = io.ReadFull(s.conn, buf[:])
+	_, err := io.ReadFull(s.conn, buf[:])
 	if err != nil {
-		return
+		return nil, err
 	}
-	var sID uint32
-	err = binary.Read(bytes.NewReader(buf[:4]), binary.BigEndian, &sID)
-	if err != nil {
-		return
-	}
+	sID := binary.BigEndian.Uint32(buf[0:4])
 	flag := buf[4]
-	var dataLen uint16
-	err = binary.Read(bytes.NewReader(buf[5:]), binary.BigEndian, &dataLen)
-	if err != nil {
-		return
-	}
-	frame = muxFrame{sID: sID, flag: flag, dataLen: dataLen}
+	dataLen := binary.BigEndian.Uint16(buf[5:7])
 	if dataLen > 0 {
 		data := make([]byte, dataLen)
-		_, err = io.ReadFull(s.conn, data[:])
+		_, err := io.ReadFull(s.conn, data[0:dataLen])
 		if err != nil {
-			return
+			return nil, err
 		}
-		frame.data = data
+		return newFrame(sID, flag, dataLen, data), nil
+	} else {
+		return newFrame(sID, flag, dataLen, nil), nil
 	}
-	return
 }
 
 func (s *Session) writeFrame(frame *muxFrame) error {
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, frame.sID)
-	buf.WriteByte(frame.flag)
-	binary.Write(buf, binary.BigEndian, frame.dataLen)
+	s.wlock.Lock()
+	defer s.wlock.Unlock()
+
+	var buf [65535 + 8]byte
+	binary.BigEndian.PutUint32(buf[0:], frame.sID)
+	buf[4] = frame.flag
+	binary.BigEndian.PutUint16(buf[5:], frame.dataLen)
 	if frame.dataLen > 0 {
-		buf.Write(frame.data)
+		copy(buf[7:], frame.data[0:frame.dataLen])
 	}
-	_, err := s.conn.Write(buf.Bytes())
+	_, err := s.conn.Write(buf[0 : uint32(frame.dataLen)+7])
 	return err
 }
 
@@ -196,15 +209,14 @@ func (s *Session) newStream(sID uint32) (*Stream, error) {
 		return nil, io.EOF
 	}
 	stream := &Stream{
-		id:               sID,
-		inboundArriving:  make(chan []byte),
-		inboundDeparture: make(chan []byte),
-		quit:             make(chan bool),
-		session:          s,
+		id:      sID,
+		up:      utils.NewBytePipe(fmt.Sprintf("%d-UP", sID), 0),
+		quit:    make(chan bool),
+		session: s,
 	}
 
 	s.streams[sID] = stream
-	go stream.loop()
+	go stream.up.Start()
 	return stream, nil
 }
 
@@ -217,56 +229,26 @@ func (s *Session) clearStream(sID uint32) {
 
 func (s *Session) loop() {
 	var pendingStream []*Stream
-	var pendingWrite []*muxFrame
 
 	readCh := make(chan *muxFrame)
 	// reader
 	go func() {
 		for {
-			frame, err := s.readFrame()
+			f, err := s.readFrame()
 			if err != nil {
 				break
 			}
-			readCh <- &frame
+			readCh <- f
 		}
 		s.cloze()
 		close(s.quit)
 		return
 	}()
 
-	// writer
-	go func() {
-	writeLoop:
-		for {
-			select {
-			case frame := <-s.writeCh:
-				buf := new(bytes.Buffer)
-				binary.Write(buf, binary.BigEndian, frame.sID)
-				buf.WriteByte(frame.flag)
-				binary.Write(buf, binary.BigEndian, frame.dataLen)
-				if frame.dataLen > 0 {
-					buf.Write(frame.data)
-				}
-				_, err := s.conn.Write(buf.Bytes())
-				if err != nil {
-					// close to notify reader
-					s.cloze()
-					break writeLoop
-				}
-			case <-s.quit:
-				// signal from reader that this session ends
-				break writeLoop
-			}
-		}
-		return
-	}()
-
 loop:
 	for {
-		var writeCh chan *muxFrame
 		var streamCh chan *Stream
 		var curStream *Stream
-		var curFrame *muxFrame
 		var timer *time.Timer
 		var to <-chan time.Time
 
@@ -280,11 +262,6 @@ loop:
 			curStream = pendingStream[0]
 		}
 
-		if len(pendingWrite) > 0 {
-			writeCh = s.writeCh
-			curFrame = pendingWrite[0]
-		}
-
 		select {
 		case <-to:
 			s.mapLock.Lock()
@@ -296,36 +273,37 @@ loop:
 			break loop
 		case streamCh <- curStream:
 			pendingStream = pendingStream[1:]
-		case writeCh <- curFrame:
-			pendingWrite = pendingWrite[1:]
-		case fr := <-readCh:
-			stream := s.getStream(fr.sID)
+		case f := <-readCh:
+			stream := s.getStream(f.sID)
 			// SYN
-			if (stream == nil) && (fr.flag&SYN != 0) {
-				stream, _ = s.newStream(fr.sID)
+			if (stream == nil) && (f.flag&SYN != 0) {
+				stream, _ = s.newStream(f.sID)
 				if !s.isClient {
 					pendingStream = append(pendingStream, stream)
 				}
 			}
 
 			// DATA
-			if (fr.flag&DATA != 0) && (fr.dataLen > 0) {
+			if (f.flag&DATA != 0) && (f.dataLen > 0) {
 				if stream != nil {
-					stream.newData(fr.data)
+					stream.up.In(f.data, time.Time{})
 				} else {
 					// unsolicited frame, respond with RST
-					// use a buffer so reading loop　would not be blocked
-					pendingWrite = append(pendingWrite, &muxFrame{sID: fr.sID, flag: RST})
+					rst := newFrame(f.sID, RST, 0, nil)
+					s.writeFrame(rst)
+					releaseFrame(rst)
 				}
 			}
 
 			// FIN or RST
-			if (fr.flag&FIN != 0) || (fr.flag&RST != 0) {
+			if (f.flag&FIN != 0) || (f.flag&RST != 0) {
 				if stream != nil {
-					s.clearStream(fr.sID)
+					s.clearStream(f.sID)
 					stream.cloze()
 				}
 			}
+			releaseFrame(f)
+
 		case <-s.quit:
 			// quit message needs to broadcast to all streams.
 			s.mapLock.Lock()
@@ -356,119 +334,56 @@ func (s *Session) localAddr() net.Addr {
 	return s.conn.LocalAddr()
 }
 
-func (m *Stream) loop() {
-loop:
-	for {
-		var ch chan []byte
-		var pending []byte
-
-		if len(m.inboundPending) > 0 {
-			ch = m.inboundDeparture
-			pending = m.inboundPending[0]
-		}
-
-		select {
-		case <-m.quit:
-			break loop
-		case data := <-m.inboundArriving:
-			m.inboundPending = append(m.inboundPending, data)
-		case ch <- pending:
-			m.inboundPending = m.inboundPending[1:]
-		}
-	}
-	close(m.inboundDeparture)
-}
-
-func (m *Stream) newData(data []byte) {
-	select {
-	case <-m.quit:
-	case m.inboundArriving <- data:
-	}
-}
-
-func (m *Stream) Read(b []byte) (n int, err error) {
-	var buf []byte
-	var ok bool
-	var timeout <-chan time.Time
-
-	if len(m.inboundCur) != 0 {
-		buf = m.inboundCur
-	} else {
-		if !m.readDeadline.IsZero() {
-			t := time.NewTimer(m.writeDeadline.Sub(time.Now()))
-			defer t.Stop()
-			timeout = t.C
-		}
-		select {
-		case buf, ok = <-m.inboundDeparture:
-			if !ok {
-				if len(m.inboundPending) > 0 {
-					buf = m.inboundPending[0]
-					m.inboundPending = m.inboundPending[1:]
-				} else {
-					err = io.EOF
-					return
-				}
-			}
-			break
-		case <-timeout:
-			err = &timeoutError{}
+func (m *Stream) Read(buf []byte) (n int, err error) {
+	if len(m.upCur) == 0 {
+		m.upCur, err = m.up.Out(m.readDeadline)
+		if err != nil {
 			return
 		}
 	}
-
-	n = copy(b, buf)
-	m.inboundCur = buf[n:]
+	n = copy(buf, m.upCur)
+	m.upCur = m.upCur[n:]
 	return
 }
 
 func (m *Stream) Write(b []byte) (int, error) {
 	var timeout <-chan time.Time
-	var frame *muxFrame
-	var sent int = 0
-	var total int = len(b)
-
 	if !m.writeDeadline.IsZero() {
 		t := time.NewTimer(m.writeDeadline.Sub(time.Now()))
 		defer t.Stop()
 		timeout = t.C
 	}
 
+	sent := 0
+	total := len(b)
 loop:
 	for {
-		n := total - sent
-		if n <= 0 {
-			break loop
-		}
-		if n > maxDataLen {
-			n = maxDataLen
-		}
-		buf := make([]byte, n)
-		copy(buf, b[sent:sent+n])
-		frame = &muxFrame{
-			sID:     m.id,
-			flag:    DATA,
-			dataLen: uint16(n),
-			data:    buf,
-		}
-		if !m.synSent && m.session.isClient {
-			frame.flag |= SYN
-			m.synSent = true
-		}
-
 		select {
-		case <-m.quit:
-			return sent, &net.OpError{Op: "write", Err: syscall.EPIPE}
 		case <-m.session.quit:
 			return sent, &net.OpError{Op: "write", Err: syscall.EPIPE}
-		case m.session.writeCh <- frame:
-			frame = nil
-			sent += n
-			if sent == total {
+		case <-m.quit:
+			return sent, &net.OpError{Op: "write", Err: syscall.EPIPE}
+		case <-timeout:
+			return sent, &utils.TimeoutError{}
+		default:
+			n := total - sent
+			if n <= 0 {
 				break loop
 			}
-		case <-timeout:
-			return sent, &timeoutError{}
+			if n > maxDataLen {
+				n = maxDataLen
+			}
+			f := newFrame(m.id, DATA, uint16(n), b[sent:sent+n])
+			if !m.synSent && m.session.isClient {
+				f.flag |= SYN
+				m.synSent = true
+			}
+			err := m.session.writeFrame(f)
+			if err != nil {
+				return sent, err
+			}
+			releaseFrame(f)
+			sent += n
 		}
 	}
 	return total, nil
@@ -477,10 +392,13 @@ loop:
 func (m *Stream) Close() error {
 	m.session.clearStream(m.id)
 	if m.cloze() {
+		fin := newFrame(m.id, FIN, 0, nil)
 		select {
 		case <-m.session.quit:
-		case m.session.writeCh <- &muxFrame{sID: m.id, flag: FIN}:
+		default:
+			m.session.writeFrame(fin)
 		}
+		releaseFrame(fin)
 	}
 	return nil
 }
@@ -490,6 +408,7 @@ func (m *Stream) cloze() bool {
 		return false
 	}
 	close(m.quit)
+	m.up.Stop()
 	return true
 }
 
@@ -522,9 +441,3 @@ func (m *Stream) RemoteAddr() net.Addr {
 func (m *Stream) LocalAddr() net.Addr {
 	return m.session.localAddr()
 }
-
-type timeoutError struct{}
-
-func (e *timeoutError) Error() string   { return "i/o timeout" }
-func (e *timeoutError) Timeout() bool   { return true }
-func (e *timeoutError) Temporary() bool { return true }

@@ -6,7 +6,7 @@ import (
 	"log"
 	"net"
 	"time"
-	
+
 	"github.com/yinghuocho/gosocks"
 )
 
