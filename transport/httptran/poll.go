@@ -37,7 +37,7 @@ const (
 	maxPollInterval        = 5 * time.Second
 	pollIntervalMultiplier = 1.5
 	maxTries               = 5
-	retryDelay             = 5 * time.Second
+	retryDelay             = 2 * time.Second
 
 	turnaroundTimeout    = 20 * time.Millisecond
 	maxTurnaroundTimeout = 200 * time.Millisecond
@@ -161,7 +161,7 @@ type pollSessionClientHandler struct {
 	gen     PollRequestGenerator
 }
 
-func sendRecv(rt http.RoundTripper, req *http.Request) (resp *http.Response, err error) {
+func sendRecv(rt http.RoundTripper, req *http.Request, rawBody []byte) (resp *http.Response, err error) {
 	defer func() {
 		if err != nil {
 			if resp != nil {
@@ -172,10 +172,17 @@ func sendRecv(rt http.RoundTripper, req *http.Request) (resp *http.Response, err
 	}()
 
 	for retries := 0; retries < maxTries; retries++ {
+		var body io.Reader
+		body = bytes.NewReader(rawBody)
+		rc, ok := body.(io.ReadCloser)
+		if !ok && body != nil {
+			rc = ioutil.NopCloser(body)
+		}
+		req.Body = rc
 		resp, err = rt.RoundTrip(req)
 		switch {
 		case err != nil:
-			log.Printf("senRecv error: %s", err)
+			log.Printf("sendRecv error: %s", err)
 		case resp.StatusCode == http.StatusOK:
 			return
 		case resp.StatusCode == http.StatusResetContent:
@@ -228,7 +235,7 @@ func (ch *pollSessionClientHandler) roundTrip(data []byte, extraHeaders map[stri
 	for k, v := range extraHeaders {
 		req.Header.Set(k, v)
 	}
-	return sendRecv(ch.rt, req)
+	return sendRecv(ch.rt, req, data)
 }
 
 func (ch *pollSessionClientHandler) handShake() error {
@@ -650,11 +657,17 @@ func (sh *PollServerHandler) processDuplexRequest(session *pollSession, w http.R
 }
 
 func (sh *PollServerHandler) processDuplexRecv(session *pollSession, w http.ResponseWriter, req *http.Request) {
-	deadline := time.Now().Add(maxDuplexRecvTimeout)
+	hardDeadline := time.Now().Add(maxDuplexRecvTimeout)
 loop:
 	for {
+		softDeadline := time.Now().Add(turnaroundTimeout)
+		deadline := softDeadline
+		if softDeadline.After(hardDeadline) {
+			deadline = hardDeadline
+		}
 		data, err := session.down.Out(deadline)
 		if err != nil {
+			// write("") to flush chunks bufferred by CDNs
 			w.Write([]byte(""))
 			if err == io.EOF {
 				sh.m.closeSession(session.sessionID)

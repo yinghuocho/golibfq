@@ -234,7 +234,6 @@ loop:
 			if udpReq.Frag != gosocks.SocksNoFragment {
 				continue
 			}
-
 			clientAddr = pkt.Addr
 			datagram := gosocks.PackUDPRequest(udpReq)
 			_, err = writeDatagramFrame(tun, &datagramFrame{uint16(len(datagram)), datagram}, socks.Timeout)
