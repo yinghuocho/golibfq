@@ -657,6 +657,7 @@ func (sh *PollServerHandler) processDuplexRequest(session *pollSession, w http.R
 }
 
 func (sh *PollServerHandler) processDuplexRecv(session *pollSession, w http.ResponseWriter, req *http.Request) {
+	start := false
 	hardDeadline := time.Now().Add(maxDuplexRecvTimeout)
 loop:
 	for {
@@ -667,14 +668,21 @@ loop:
 		}
 		data, err := session.down.Out(deadline)
 		if err != nil {
-			// write("") to flush chunks bufferred by CDNs
-			w.Write([]byte(""))
-			if err == io.EOF {
-				sh.m.closeSession(session.sessionID)
+			if e, ok := err.(*utils.TimeoutError); ok && e.Timeout() {
+				if !start && !deadline.After(hardDeadline) {
+					continue
+				}
+			} else {
+				// write("") to flush chunks bufferred by CDNs
+				w.Write([]byte(""))
+				if err == io.EOF {
+					sh.m.closeSession(session.sessionID)
+				}
+				break loop
 			}
-			break loop
 		}
 		n, err := w.Write(data)
+		start = true
 		if err != nil {
 			log.Println(n, err)
 		}
