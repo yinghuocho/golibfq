@@ -50,12 +50,30 @@ type AppData struct {
 	lock sync.RWMutex
 }
 
+func OpenAppDataByFile(f *os.File) (*AppData, error) {
+	name := f.Name()
+	log.Printf("app data file: %s", name)
+	decoder := json.NewDecoder(f)
+	v := make(map[string]string)
+	e := decoder.Decode(&v)
+	if e != nil {
+		if e != io.EOF {
+			return nil, e
+		}
+	}
+	return &AppData{
+		FileName: name,
+		data:     v,
+	}, nil
+}
+
 func OpenAppData(appName string) (*AppData, error) {
 	u, e := user.Current()
 	if e != nil {
 		return nil, e
 	}
 	name := path.Join(u.HomeDir, "."+appName+".conf")
+	log.Printf("app data file: %s", name)
 	f, e := os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0666)
 	if e != nil {
 		return nil, e

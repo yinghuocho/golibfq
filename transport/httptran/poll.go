@@ -43,7 +43,7 @@ const (
 	maxTurnaroundTimeout = 200 * time.Millisecond
 	maxSessionStaleness  = 120 * time.Second
 
-	maxDuplexRecvTimeout = 2 * time.Minute
+	maxDuplexRecvTimeout = 30 * time.Second
 )
 
 // client side
@@ -157,8 +157,9 @@ func (s *pollSession) isClosed() bool {
 
 type pollSessionClientHandler struct {
 	session *pollSession
-	rt      http.RoundTripper
-	gen     PollRequestGenerator
+	// rt      http.RoundTripper
+	transport *http.Transport
+	gen       PollRequestGenerator
 }
 
 func sendRecv(rt http.RoundTripper, req *http.Request, rawBody []byte) (resp *http.Response, err error) {
@@ -235,7 +236,7 @@ func (ch *pollSessionClientHandler) roundTrip(data []byte, extraHeaders map[stri
 	for k, v := range extraHeaders {
 		req.Header.Set(k, v)
 	}
-	return sendRecv(ch.rt, req, data)
+	return sendRecv(ch.transport, req, data)
 }
 
 func (ch *pollSessionClientHandler) handShake() error {
@@ -353,6 +354,7 @@ loop:
 		}
 	}
 	ch.session.Close()
+	ch.transport.CloseIdleConnections()
 }
 
 func (ch *pollSessionClientHandler) duplexRecvLoop() {
@@ -360,15 +362,17 @@ loop:
 	for {
 		resp, err := ch.roundTrip(nil, map[string]string{"X-Session-Ctrl": "DUPLEX-RECV"})
 		if err != nil {
+			log.Println("duplexRecvLoop: error roundTrip: %s", err)
 			break loop
 		}
 		_, err = readResponse(resp, ch.session.up)
 		if err != nil {
-			log.Println(err)
+			log.Println("duplexRecvLoop: error readResponse: %s", err)
 			break loop
 		}
 	}
 	ch.session.Close()
+	ch.transport.CloseIdleConnections()
 }
 
 func (ch *pollSessionClientHandler) duplexSendLoop() {
@@ -377,7 +381,6 @@ loop:
 		if ch.session.isClosed() {
 			resp, _ := ch.roundTrip(nil, map[string]string{"X-Session-Ctrl": "FIN"})
 			if resp != nil {
-				io.Copy(ioutil.Discard, resp.Body)
 				resp.Body.Close()
 			}
 			break loop
@@ -385,9 +388,9 @@ loop:
 
 		data, err := ch.session.down.Out(time.Time{})
 		if err == io.EOF {
+			log.Printf("duplexSendLoop: outbound stream closed")
 			resp, _ := ch.roundTrip(nil, map[string]string{"X-Session-Ctrl": "FIN"})
 			if resp != nil {
-				io.Copy(ioutil.Discard, resp.Body)
 				resp.Body.Close()
 			}
 			break loop
@@ -410,7 +413,9 @@ loop:
 			}
 			resp, err := ch.roundTrip(chunk, nil)
 			if err != nil {
-				break loop
+				log.Printf("duplexSendLoop error: %s", err)
+				ch.session.Close()
+				break inner
 			}
 			io.Copy(ioutil.Discard, resp.Body)
 			resp.Body.Close()
@@ -418,6 +423,7 @@ loop:
 		}
 	}
 	ch.session.Close()
+	ch.transport.CloseIdleConnections()
 }
 
 func newPollSession(sessionID string) *pollSession {
@@ -431,12 +437,12 @@ func newPollSession(sessionID string) *pollSession {
 	return s
 }
 
-func NewPollClientSession(rt http.RoundTripper, gen PollRequestGenerator) (net.Conn, error) {
+func NewPollClientSession(transport *http.Transport, gen PollRequestGenerator) (net.Conn, error) {
 	sessionID := genSessionID()
 	ch := &pollSessionClientHandler{
-		session: newPollSession(sessionID),
-		rt:      rt,
-		gen:     gen,
+		session:   newPollSession(sessionID),
+		transport: transport,
+		gen:       gen,
 	}
 	err := ch.handShake()
 	if err != nil {
@@ -447,12 +453,12 @@ func NewPollClientSession(rt http.RoundTripper, gen PollRequestGenerator) (net.C
 	return ch.session, nil
 }
 
-func NewDuplexClientSession(rt http.RoundTripper, gen PollRequestGenerator) (net.Conn, error) {
+func NewDuplexClientSession(transport *http.Transport, gen PollRequestGenerator) (net.Conn, error) {
 	sessionID := genSessionID()
 	ch := &pollSessionClientHandler{
-		session: newPollSession(sessionID),
-		rt:      rt,
-		gen:     gen,
+		session:   newPollSession(sessionID),
+		transport: transport,
+		gen:       gen,
 	}
 	err := ch.duplexHandShake()
 	if err != nil {
@@ -663,23 +669,17 @@ loop:
 	for {
 		softDeadline := time.Now().Add(turnaroundTimeout)
 		deadline := softDeadline
-		if softDeadline.After(hardDeadline) {
+		if softDeadline.After(hardDeadline) || !start {
 			deadline = hardDeadline
 		}
 		data, err := session.down.Out(deadline)
 		if err != nil {
-			if e, ok := err.(*utils.TimeoutError); ok && e.Timeout() {
-				if !start && !deadline.After(hardDeadline) {
-					continue
-				}
-			} else {
-				// write("") to flush chunks bufferred by CDNs
-				w.Write([]byte(""))
-				if err == io.EOF {
-					sh.m.closeSession(session.sessionID)
-				}
-				break loop
+			// write("") to flush chunks bufferred by CDNs
+			w.Write([]byte(""))
+			if err == io.EOF {
+				sh.m.closeSession(session.sessionID)
 			}
+			break loop
 		}
 		n, err := w.Write(data)
 		start = true

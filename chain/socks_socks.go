@@ -4,7 +4,7 @@ import (
 	"log"
 	"net"
 	"time"
-	
+
 	"github.com/yinghuocho/gosocks"
 )
 
@@ -100,12 +100,13 @@ func (ss *SocksSocksChain) UDPAssociate(req *gosocks.SocksRequest, src *gosocks.
 	go gosocks.ConnMonitor(dst, quitDst)
 
 	// read client UPD packets
+	quitUDP := make(chan bool)
 	chClientUDP := make(chan *gosocks.UDPPacket)
-	go gosocks.UDPReader(clientBind, chClientUDP)
+	go gosocks.UDPReader(clientBind, chClientUDP, quitUDP)
 
 	// read relay UPD packets
 	chRelayUDP := make(chan *gosocks.UDPPacket)
-	go gosocks.UDPReader(relayBind, chRelayUDP)
+	go gosocks.UDPReader(relayBind, chRelayUDP, quitUDP)
 
 loop:
 	for {
@@ -174,6 +175,5 @@ loop:
 	dst.Close()
 	clientBind.Close()
 	relayBind.Close()
-	<-chClientUDP
-	<-chRelayUDP
+	close(quitUDP)
 }

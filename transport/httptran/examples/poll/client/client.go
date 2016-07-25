@@ -18,7 +18,7 @@ type handler struct {
 	tunnelAuth sockstun.TunnelAuthenticator
 }
 
-var tr http.RoundTripper = &http.Transport{
+var transport *http.Transport = &http.Transport{
 	Proxy: nil,
 	Dial: (&net.Dialer{
 		Timeout:   30 * time.Second,
@@ -48,7 +48,7 @@ func (h *handler) Quit() {}
 func main() {
 	URL, _ := url.Parse("http://127.0.0.1:8888")
 	httpConn, err := httptran.NewPollClientSession(
-		tr,
+		transport,
 		&httptran.DomainFrontingPollRequestGenerator{URL: URL},
 	)
 	if err != nil {
