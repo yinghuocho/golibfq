@@ -44,7 +44,7 @@ type Session struct {
 	//
 	// Closed session has a nil map to prevent new streams by Client.OpenStream
 	streams map[uint32]*Stream
-	mapLock *sync.Mutex
+	mapLock sync.Mutex
 
 	// Used by Server to write new Streams to someone waiting on Server.Accept.
 	streamCh chan *Stream
@@ -108,7 +108,6 @@ func NewClient(c net.Conn) *Client {
 		conn:     c,
 		streams:  make(map[uint32]*Stream),
 		quit:     make(chan bool),
-		mapLock:  &sync.Mutex{},
 		streamCh: make(chan *Stream),
 	}
 	go s.loop()
@@ -134,7 +133,6 @@ func NewServer(c net.Conn) *Server {
 		conn:     c,
 		streams:  make(map[uint32]*Stream),
 		quit:     make(chan bool),
-		mapLock:  &sync.Mutex{},
 		streamCh: make(chan *Stream),
 	}
 	go s.loop()
