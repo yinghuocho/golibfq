@@ -6,9 +6,11 @@
 package httptran
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -61,6 +63,7 @@ func (df *DomainFrontingPollRequestGenerator) GenerateRequest(data []byte) (*htt
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Connection", "keep-alive")
 	if df.Host != "" {
 		req.Host = df.Host
 	}
@@ -155,11 +158,127 @@ func (s *pollSession) isClosed() bool {
 	return atomic.LoadUint32(&s.quitFlag) > 0
 }
 
+type ClosableRoundTripper interface {
+	http.RoundTripper
+	io.Closer
+}
+
+type SimpleSingleThreadTransport struct {
+	Dial         func(network, addr string) (net.Conn, error)
+	DialTLS      func(network, addr string) (net.Conn, error)
+	DialTimeout  time.Duration
+	WriteTimeout time.Duration
+	ReadTimeout  time.Duration
+
+	conn net.Conn
+	r    *bufio.Reader
+}
+
+func hasPort(s string) bool { return strings.LastIndex(s, ":") > strings.LastIndex(s, "]") }
+
+var portMap = map[string]string{
+	"http":  "80",
+	"https": "443",
+}
+
+// canonicalAddr returns url.Host but always with a ":port" suffix
+func canonicalAddr(url *url.URL) string {
+	addr := url.Host
+	if !hasPort(addr) {
+		return addr + ":" + portMap[url.Scheme]
+	}
+	return addr
+}
+
+func (tp *SimpleSingleThreadTransport) getConn(req *http.Request) error {
+	var (
+		c net.Conn
+		e error
+	)
+	addr := canonicalAddr(req.URL)
+	switch req.URL.Scheme {
+	case "http":
+		c, e = tp.Dial("tcp", addr)
+	case "https":
+		c, e = tp.DialTLS("tcp", addr)
+	}
+
+	if e == nil {
+		tp.conn = c
+		tp.r = bufio.NewReader(c)
+	}
+	return e
+}
+
+func closeRequest(req *http.Request) {
+	if req.Body != nil {
+		req.Body.Close()
+	}
+}
+
+func (tp *SimpleSingleThreadTransport) Close() error {
+	if tp.conn != nil {
+		e := tp.conn.Close()
+		tp.conn = nil
+		return e
+	} else {
+		return nil
+	}
+}
+
+// caller must esure to call Response.Body.Close before
+// it is caller's responsiblity to retry
+func (tp *SimpleSingleThreadTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL == nil {
+		closeRequest(req)
+		return nil, errors.New("http: nil Request.URL")
+	}
+	if req.Header == nil {
+		closeRequest(req)
+		return nil, errors.New("http: nil Request.Header")
+	}
+	if s := req.URL.Scheme; s != "http" && s != "https" {
+		closeRequest(req)
+		return nil, fmt.Errorf("unsupported protocol scheme %s", s)
+	}
+	if req.URL.Host == "" {
+		closeRequest(req)
+		return nil, errors.New("http: no Host in request URL")
+	}
+
+	// retry handles to caller
+	if tp.conn == nil {
+		err := tp.getConn(req)
+		if err != nil {
+			closeRequest(req)
+			return nil, err
+		}
+	}
+	tp.conn.SetWriteDeadline(time.Now().Add(tp.WriteTimeout))
+	err := req.Write(tp.conn)
+	if err != nil {
+		closeRequest(req)
+		tp.conn.Close()
+		tp.conn = nil
+		return nil, err
+	}
+	tp.conn.SetReadDeadline(time.Now().Add(tp.ReadTimeout))
+	resp, err := http.ReadResponse(tp.r, req)
+	if err != nil {
+		closeRequest(req)
+		tp.conn.Close()
+		tp.conn = nil
+		return nil, err
+	}
+	return resp, nil
+}
+
 type pollSessionClientHandler struct {
-	session *pollSession
-	// rt      http.RoundTripper
-	transport *http.Transport
-	gen       PollRequestGenerator
+	session       *pollSession
+	sendTransport ClosableRoundTripper
+	recvTransport ClosableRoundTripper
+	transport     ClosableRoundTripper
+	gen           PollRequestGenerator
 }
 
 func sendRecv(rt http.RoundTripper, req *http.Request, rawBody []byte) (resp *http.Response, err error) {
@@ -227,7 +346,7 @@ func readResponse(resp *http.Response, pipe *utils.BytePipe) (int, error) {
 	return total, err
 }
 
-func (ch *pollSessionClientHandler) roundTrip(data []byte, extraHeaders map[string]string) (*http.Response, error) {
+func (ch *pollSessionClientHandler) roundTrip(transport ClosableRoundTripper, data []byte, extraHeaders map[string]string) (*http.Response, error) {
 	req, err := ch.gen.GenerateRequest(data)
 	if err != nil {
 		return nil, err
@@ -236,12 +355,12 @@ func (ch *pollSessionClientHandler) roundTrip(data []byte, extraHeaders map[stri
 	for k, v := range extraHeaders {
 		req.Header.Set(k, v)
 	}
-	return sendRecv(ch.transport, req, data)
+	return sendRecv(transport, req, data)
 }
 
 func (ch *pollSessionClientHandler) handShake() error {
 	// a message for handshake, similar as a TCP SYN
-	resp, err := ch.roundTrip(nil, map[string]string{"X-Session-Ctrl": "SYN"})
+	resp, err := ch.roundTrip(ch.transport, nil, map[string]string{"X-Session-Ctrl": "SYN"})
 	if resp != nil {
 		defer func() {
 			io.Copy(ioutil.Discard, resp.Body)
@@ -266,7 +385,7 @@ func (ch *pollSessionClientHandler) handShake() error {
 
 func (ch *pollSessionClientHandler) duplexHandShake() error {
 	// a message for handshake, similar as a TCP SYN
-	resp, err := ch.roundTrip(nil, map[string]string{"X-Session-Ctrl": "SYN-DUPLEX"})
+	resp, err := ch.roundTrip(ch.sendTransport, nil, map[string]string{"X-Session-Ctrl": "SYN-DUPLEX"})
 	if resp != nil {
 		defer func() {
 			io.Copy(ioutil.Discard, resp.Body)
@@ -295,7 +414,7 @@ func (ch *pollSessionClientHandler) pollLoop() {
 loop:
 	for {
 		if ch.session.isClosed() {
-			resp, _ := ch.roundTrip(nil, map[string]string{"X-Session-Ctrl": "FIN"})
+			resp, _ := ch.roundTrip(ch.transport, nil, map[string]string{"X-Session-Ctrl": "FIN"})
 			if resp != nil {
 				io.Copy(ioutil.Discard, resp.Body)
 				resp.Body.Close()
@@ -305,7 +424,7 @@ loop:
 
 		data, err := ch.session.down.Out(time.Now().Add(interval))
 		if err == io.EOF {
-			resp, _ := ch.roundTrip(nil, map[string]string{"X-Session-Ctrl": "FIN"})
+			resp, _ := ch.roundTrip(ch.transport, nil, map[string]string{"X-Session-Ctrl": "FIN"})
 			if resp != nil {
 				io.Copy(ioutil.Discard, resp.Body)
 				resp.Body.Close()
@@ -329,13 +448,18 @@ loop:
 			default:
 				chunk = data[sent : sent+n]
 			}
-			resp, err := ch.roundTrip(chunk, nil)
+			resp, err := ch.roundTrip(ch.transport, chunk, nil)
 			if err != nil {
 				break loop
 			}
 			rbytes, err = readResponse(resp, ch.session.up)
 			if err != nil {
 				break loop
+			}
+			if resp.Close {
+				// server said the underlying connection should be closed
+				log.Printf("pollLoop: Transport received Close signal from server")
+				ch.transport.Close()
 			}
 			if chunk == nil {
 				break inner
@@ -354,32 +478,37 @@ loop:
 		}
 	}
 	ch.session.Close()
-	ch.transport.CloseIdleConnections()
+	ch.transport.Close()
 }
 
 func (ch *pollSessionClientHandler) duplexRecvLoop() {
 loop:
 	for {
-		resp, err := ch.roundTrip(nil, map[string]string{"X-Session-Ctrl": "DUPLEX-RECV"})
+		resp, err := ch.roundTrip(ch.recvTransport, nil, map[string]string{"X-Session-Ctrl": "DUPLEX-RECV"})
 		if err != nil {
-			log.Println("duplexRecvLoop: error roundTrip: %s", err)
+			log.Printf("duplexRecvLoop: error roundTrip: %s", err)
 			break loop
 		}
 		_, err = readResponse(resp, ch.session.up)
 		if err != nil {
-			log.Println("duplexRecvLoop: error readResponse: %s", err)
+			log.Printf("duplexRecvLoop: error readResponse: %s", err)
 			break loop
+		}
+		if resp.Close {
+			// server said the underlying connection should be closed
+			log.Printf("duplexRecvLoop: Transport received Close signal from server")
+			ch.recvTransport.Close()
 		}
 	}
 	ch.session.Close()
-	ch.transport.CloseIdleConnections()
+	ch.recvTransport.Close()
 }
 
 func (ch *pollSessionClientHandler) duplexSendLoop() {
 loop:
 	for {
 		if ch.session.isClosed() {
-			resp, _ := ch.roundTrip(nil, map[string]string{"X-Session-Ctrl": "FIN"})
+			resp, _ := ch.roundTrip(ch.sendTransport, nil, map[string]string{"X-Session-Ctrl": "FIN"})
 			if resp != nil {
 				resp.Body.Close()
 			}
@@ -389,7 +518,7 @@ loop:
 		data, err := ch.session.down.Out(time.Time{})
 		if err == io.EOF {
 			log.Printf("duplexSendLoop: outbound stream closed")
-			resp, _ := ch.roundTrip(nil, map[string]string{"X-Session-Ctrl": "FIN"})
+			resp, _ := ch.roundTrip(ch.sendTransport, nil, map[string]string{"X-Session-Ctrl": "FIN"})
 			if resp != nil {
 				resp.Body.Close()
 			}
@@ -411,7 +540,7 @@ loop:
 			default:
 				chunk = data[sent : sent+n]
 			}
-			resp, err := ch.roundTrip(chunk, nil)
+			resp, err := ch.roundTrip(ch.sendTransport, chunk, nil)
 			if err != nil {
 				log.Printf("duplexSendLoop error: %s", err)
 				ch.session.Close()
@@ -419,11 +548,16 @@ loop:
 			}
 			io.Copy(ioutil.Discard, resp.Body)
 			resp.Body.Close()
+			if resp.Close {
+				// server said the underlying connection should be closed
+				log.Printf("duplexSendLoop: Transport received Close signal from server")
+				ch.sendTransport.Close()
+			}
 			sent += n
 		}
 	}
 	ch.session.Close()
-	ch.transport.CloseIdleConnections()
+	ch.sendTransport.Close()
 }
 
 func newPollSession(sessionID string) *pollSession {
@@ -437,7 +571,7 @@ func newPollSession(sessionID string) *pollSession {
 	return s
 }
 
-func NewPollClientSession(transport *http.Transport, gen PollRequestGenerator) (net.Conn, error) {
+func NewPollClientSession(transport ClosableRoundTripper, gen PollRequestGenerator) (net.Conn, error) {
 	sessionID := genSessionID()
 	ch := &pollSessionClientHandler{
 		session:   newPollSession(sessionID),
@@ -453,12 +587,13 @@ func NewPollClientSession(transport *http.Transport, gen PollRequestGenerator) (
 	return ch.session, nil
 }
 
-func NewDuplexClientSession(transport *http.Transport, gen PollRequestGenerator) (net.Conn, error) {
+func NewDuplexClientSession(sendTransport ClosableRoundTripper, recvTransport ClosableRoundTripper, gen PollRequestGenerator) (net.Conn, error) {
 	sessionID := genSessionID()
 	ch := &pollSessionClientHandler{
-		session:   newPollSession(sessionID),
-		transport: transport,
-		gen:       gen,
+		session:       newPollSession(sessionID),
+		sendTransport: sendTransport,
+		recvTransport: recvTransport,
+		gen:           gen,
 	}
 	err := ch.duplexHandShake()
 	if err != nil {
@@ -537,7 +672,7 @@ func (m *pollSessionManager) expireSessions() {
 		m.lock.Lock()
 		for sessionID, session := range m.sessionMap {
 			if session.isExpired() {
-				// log.Printf("deleting expired session %q", sessionID)
+				log.Printf("session expired %s", sessionID)
 				delete(m.sessionMap, sessionID)
 				session.Close()
 			}
