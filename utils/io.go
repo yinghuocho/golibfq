@@ -14,6 +14,7 @@ type BytePipe struct {
 	size    int
 	iCh     chan []byte
 	oCh     chan []byte
+	rest    []byte
 	pending [][]byte
 	quit    chan bool
 }
@@ -82,6 +83,13 @@ func (bp *BytePipe) In(buf []byte, deadline time.Time) error {
 }
 
 func (bp *BytePipe) Out(deadline time.Time) ([]byte, error) {
+	// first return the "rest" chunk if any
+	if len(bp.rest) > 0 {
+		b := bp.rest
+		bp.rest = nil
+		return b, nil
+	}
+
 	var timeout <-chan time.Time
 	if !deadline.IsZero() {
 		t := time.NewTimer(deadline.Sub(time.Now()))
@@ -102,6 +110,70 @@ func (bp *BytePipe) Out(deadline time.Time) ([]byte, error) {
 	case <-timeout:
 		return nil, &TimeoutError{}
 	}
+}
+
+func (bp *BytePipe) OutToBuf(buf []byte, turnaround time.Duration, deadline time.Time) (int, error) {
+	var overall <-chan time.Time
+	var turn <-chan time.Time
+	if !deadline.IsZero() {
+		t1 := time.NewTimer(deadline.Sub(time.Now()))
+		defer t1.Stop()
+		overall = t1.C
+	}
+	max := len(buf)
+	cnt := 0
+	pos := 0
+	// first look at the "rest" chunk if any
+	if len(bp.rest) > 0 {
+		n := copy(buf[pos:], bp.rest)
+		bp.rest = bp.rest[n:]
+		pos += n
+		cnt += n
+		if cnt >= max {
+			return cnt, nil
+		}
+		// setup turn timer after getting first chunk
+		t2 := time.NewTimer(turnaround)
+		defer t2.Stop()
+		turn = t2.C
+	}
+
+	for {
+		select {
+		case b, ok := <-bp.oCh:
+			if !ok {
+				if len(bp.pending) > 0 {
+					b = bp.pending[0]
+					bp.pending = bp.pending[1:]
+				} else {
+					return cnt, io.EOF
+				}
+			}
+			n := copy(buf[pos:], b)
+			bp.rest = b[n:]
+			pos += n
+			cnt += n
+			if cnt >= max {
+				return cnt, nil
+			}
+			// setup turn timer after getting first chunk
+			if turn == nil {
+				t2 := time.NewTimer(turnaround)
+				defer t2.Stop()
+				turn = t2.C
+			}
+		case <-overall:
+			if cnt > 0 {
+				return cnt, nil
+			} else {
+				return 0, &TimeoutError{}
+			}
+		case <-turn:
+			return cnt, nil
+		}
+	}
+	// never reach here
+	return cnt, nil
 }
 
 type TimeoutError struct{}

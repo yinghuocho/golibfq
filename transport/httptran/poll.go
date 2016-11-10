@@ -41,9 +41,10 @@ const (
 	maxTries               = 5
 	retryDelay             = 2 * time.Second
 
-	turnaroundTimeout    = 20 * time.Millisecond
-	maxTurnaroundTimeout = 200 * time.Millisecond
-	maxSessionStaleness  = 120 * time.Second
+	clientTurnaroundTimeout    = 20 * time.Millisecond
+	serverTurnaroundTimeout    = 20 * time.Millisecond
+	serverMaxTurnaroundTimeout = 200 * time.Millisecond
+	maxSessionStaleness        = 120 * time.Second
 
 	maxDuplexRecvTimeout = 30 * time.Second
 )
@@ -421,8 +422,9 @@ loop:
 			}
 			break loop
 		}
-
-		data, err := ch.session.down.Out(time.Now().Add(interval))
+		var buffer [maxRequestSize]byte
+		n, err := ch.session.down.OutToBuf(buffer[:], clientTurnaroundTimeout, time.Now().Add(interval))
+		// data, err := ch.session.down.Out(time.Now().Add(interval))
 		if err == io.EOF {
 			resp, _ := ch.roundTrip(ch.transport, nil, map[string]string{"X-Session-Ctrl": "FIN"})
 			if resp != nil {
@@ -431,43 +433,56 @@ loop:
 			}
 			break loop
 		}
-
-		total := len(data)
-		sent := 0
-		rbytes := 0
-	inner:
-		for {
-			n := total - sent
-			var chunk []byte
-			switch {
-			case n == 0:
-				chunk = nil
-			case n > maxRequestSize:
-				n = maxRequestSize
-				chunk = data[sent : sent+n]
-			default:
-				chunk = data[sent : sent+n]
-			}
-			resp, err := ch.roundTrip(ch.transport, chunk, nil)
-			if err != nil {
-				break loop
-			}
-			rbytes, err = readResponse(resp, ch.session.up)
-			if err != nil {
-				break loop
-			}
-			if resp.Close {
-				// server said the underlying connection should be closed
-				log.Printf("pollLoop: Transport received Close signal from server")
-				ch.transport.Close()
-			}
-			if chunk == nil {
-				break inner
-			}
-			sent += n
+		resp, err := ch.roundTrip(ch.transport, buffer[:n], nil)
+		if err != nil {
+			break loop
 		}
+		rbytes, err := readResponse(resp, ch.session.up)
+		if err != nil {
+			break loop
+		}
+		if resp.Close {
+			// server said the underlying connection should be closed
+			log.Printf("pollLoop: Transport received Close signal from server")
+			ch.transport.Close()
+		}
+
+		// total := len(data)
+		// sent := 0
+		// rbytes := 0
+		// inner:
+		// for {
+		//	n := total - sent
+		//	var chunk []byte
+		//	switch {
+		//	case n == 0:
+		//		chunk = nil
+		//	case n > maxRequestSize:
+		//		n = maxRequestSize
+		//		chunk = data[sent : sent+n]
+		//	default:
+		//		chunk = data[sent : sent+n]
+		//	}
+		//	resp, err := ch.roundTrip(ch.transport, chunk, nil)
+		//	if err != nil {
+		//		break loop
+		//	}
+		//	rbytes, err = readResponse(resp, ch.session.up)
+		//	if err != nil {
+		//		break loop
+		//	}
+		//	if resp.Close {
+		//		// server said the underlying connection should be closed
+		//		log.Printf("pollLoop: Transport received Close signal from server")
+		//		ch.transport.Close()
+		//	}
+		//	if chunk == nil {
+		//		break inner
+		//	}
+		//	sent += n
+		// }
 		if rbytes > 0 {
-			interval = 0
+			interval = clientTurnaroundTimeout
 		} else if interval == 0 {
 			interval = initPollInterval
 		} else {
@@ -489,11 +504,13 @@ loop:
 			log.Printf("duplexRecvLoop: error roundTrip: %s", err)
 			break loop
 		}
+		// n, err := readResponse(resp, ch.session.up)
 		_, err = readResponse(resp, ch.session.up)
 		if err != nil {
 			log.Printf("duplexRecvLoop: error readResponse: %s", err)
 			break loop
 		}
+		// log.Printf("duplexRecvLoop: received %d bytes", n)
 		if resp.Close {
 			// server said the underlying connection should be closed
 			log.Printf("duplexRecvLoop: Transport received Close signal from server")
@@ -505,6 +522,7 @@ loop:
 }
 
 func (ch *pollSessionClientHandler) duplexSendLoop() {
+	txcnt := 0
 loop:
 	for {
 		if ch.session.isClosed() {
@@ -514,8 +532,9 @@ loop:
 			}
 			break loop
 		}
-
-		data, err := ch.session.down.Out(time.Time{})
+		var buffer [maxRequestSize]byte
+		n, err := ch.session.down.OutToBuf(buffer[:], clientTurnaroundTimeout, time.Time{})
+		// data, err := ch.session.down.Out(time.Time{})
 		if err == io.EOF {
 			log.Printf("duplexSendLoop: outbound stream closed")
 			resp, _ := ch.roundTrip(ch.sendTransport, nil, map[string]string{"X-Session-Ctrl": "FIN"})
@@ -524,37 +543,56 @@ loop:
 			}
 			break loop
 		}
-
-		total := len(data)
-		sent := 0
-	inner:
-		for {
-			var chunk []byte
-			n := total - sent
-			switch {
-			case n == 0:
-				break inner
-			case n > maxRequestSize:
-				n = maxRequestSize
-				chunk = data[sent : sent+n]
-			default:
-				chunk = data[sent : sent+n]
-			}
-			resp, err := ch.roundTrip(ch.sendTransport, chunk, nil)
+		if n > 0 {
+			resp, err := ch.roundTrip(ch.sendTransport, buffer[:n], nil)
 			if err != nil {
 				log.Printf("duplexSendLoop error: %s", err)
-				ch.session.Close()
-				break inner
+				break loop
 			}
 			io.Copy(ioutil.Discard, resp.Body)
 			resp.Body.Close()
+			txcnt += 1
+			// log.Printf("duplexSendLoop: sent %d requests, %d bytes in this connection", txcnt, n)
 			if resp.Close {
 				// server said the underlying connection should be closed
 				log.Printf("duplexSendLoop: Transport received Close signal from server")
 				ch.sendTransport.Close()
+				txcnt = 0
 			}
-			sent += n
 		}
+		// total := len(data)
+		// sent := 0
+		// inner:
+		// for {
+		//	var chunk []byte
+		//	n := total - sent
+		//	switch {
+		//	case n == 0:
+		//		break inner
+		//	case n > maxRequestSize:
+		//		n = maxRequestSize
+		//		chunk = data[sent : sent+n]
+		//	default:
+		//		chunk = data[sent : sent+n]
+		//	}
+		//	resp, err := ch.roundTrip(ch.sendTransport, chunk, nil)
+		//	if err != nil {
+		//		log.Printf("duplexSendLoop error: %s", err)
+		//		ch.session.Close()
+		//		break inner
+		//	}
+		//	io.Copy(ioutil.Discard, resp.Body)
+		//	resp.Body.Close()
+		//	txcnt += 1
+		//	log.Printf("duplexSendLoop: sent %d requests, %d bytes in this connection", txcnt, n)
+		//	if resp.Close {
+		// server said the underlying connection should be closed
+		//		log.Printf("duplexSendLoop: Transport received Close signal from server")
+		//		ch.sendTransport.Close()
+		//		txcnt = 0
+		//	}
+		//	sent += n
+		// }
 	}
 	ch.session.Close()
 	ch.sendTransport.Close()
@@ -802,7 +840,7 @@ func (sh *PollServerHandler) processDuplexRecv(session *pollSession, w http.Resp
 	hardDeadline := time.Now().Add(maxDuplexRecvTimeout)
 loop:
 	for {
-		softDeadline := time.Now().Add(turnaroundTimeout)
+		softDeadline := time.Now().Add(serverTurnaroundTimeout)
 		deadline := softDeadline
 		if softDeadline.After(hardDeadline) || !start {
 			deadline = hardDeadline
@@ -839,9 +877,9 @@ func (sh *PollServerHandler) processRequest(session *pollSession, w http.Respons
 	if len(data) > 0 {
 		session.up.In(data, time.Time{})
 	}
-	hardDeadline := time.Now().Add(maxTurnaroundTimeout)
+	hardDeadline := time.Now().Add(serverMaxTurnaroundTimeout)
 	for {
-		softDeadline := time.Now().Add(turnaroundTimeout)
+		softDeadline := time.Now().Add(serverTurnaroundTimeout)
 		deadline := softDeadline
 		if softDeadline.After(hardDeadline) {
 			deadline = hardDeadline
