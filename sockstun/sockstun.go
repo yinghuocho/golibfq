@@ -31,11 +31,8 @@ func writeDatagramFrame(conn net.Conn, frame *datagramFrame, timeout time.Durati
 	return conn.Write(buf)
 }
 
-func readDatagramFrame(conn net.Conn, timeout time.Duration) (frame *datagramFrame, err error) {
-	conn.SetReadDeadline(time.Now().Add(timeout))
-
+func readDatagramFrame(r io.Reader, timeout time.Duration) (frame *datagramFrame, err error) {
 	var buf [2]byte
-	r := bufio.NewReader(conn)
 	_, err = io.ReadFull(r, buf[:])
 	if err != nil {
 		return
@@ -51,10 +48,13 @@ func readDatagramFrame(conn net.Conn, timeout time.Duration) (frame *datagramFra
 }
 
 func datagramFrameReader(conn net.Conn, timeout time.Duration, ch chan<- *datagramFrame, quit chan bool) {
+	r := bufio.NewReader(conn)
 loop:
 	for {
-		frame, err := readDatagramFrame(conn, timeout)
+		conn.SetReadDeadline(time.Now().Add(timeout))
+		frame, err := readDatagramFrame(r, timeout)
 		if err != nil {
+			log.Printf("tunnel connection Read error: %s", err)
 			break
 		}
 		select {
@@ -85,6 +85,9 @@ func NewTunnelAnonymousAuthenticator() *TunnelAnonymousAuthenticator {
 
 func (a *TunnelAnonymousAuthenticator) ClientAuthenticate(socks *gosocks.SocksConn, tun net.Conn) (err error) {
 	err = a.serverAuth.ServerAuthenticate(socks)
+	if err != nil {
+		log.Printf("error to authenticate: %s", err)
+	}
 	// save one round-trip by avoiding authentication with remote server.
 	// if err != nil {
 	//	  return
@@ -114,9 +117,11 @@ func TunnelClient(socks *gosocks.SocksConn, tun net.Conn) {
 	}
 	switch req.Cmd {
 	case gosocks.SocksCmdConnect:
+		log.Printf("cmd connect")
 		TunnelTCP(req, socks, tun, socks.Timeout)
 		return
 	case gosocks.SocksCmdUDPAssociate:
+		log.Printf("cmd udp associate")
 		TunnelClientUDP(req, socks, tun)
 		return
 	case gosocks.SocksCmdBind:
@@ -192,11 +197,11 @@ func TunnelUDPAssociate(req *gosocks.SocksRequest, clientBind *net.UDPConn, clie
 
 	quitUDP := make(chan bool)
 	// read UDP request from client
-	chClientUDP := make(chan *gosocks.UDPPacket)
+	chClientUDP := make(chan *gosocks.UDPPacket, 100)
 	go gosocks.UDPReader(clientBind, chClientUDP, quitUDP)
 
 	// read UDP request from tunnel
-	chTunnelDatagram := make(chan *datagramFrame)
+	chTunnelDatagram := make(chan *datagramFrame, 100)
 	go datagramFrameReader(tun, socks.Timeout, chTunnelDatagram, quitUDP)
 
 loop:
@@ -218,7 +223,8 @@ loop:
 			udpReq, err := gosocks.ParseUDPRequest(pkt.Data)
 			if err != nil {
 				log.Printf("error to parse UDP packet: %s", err)
-				break loop
+				continue
+				//break loop
 			}
 			// 3) no fragment
 			if udpReq.Frag != gosocks.SocksNoFragment {
@@ -236,6 +242,7 @@ loop:
 		case frame, ok := <-chTunnelDatagram:
 			t.Stop()
 			if !ok {
+				log.Printf("tunnel connection ends")
 				break loop
 			}
 			_, err := clientBind.WriteToUDP(frame.datagram, clientAddr)
@@ -257,8 +264,11 @@ loop:
 	}
 
 	// quit
+	log.Printf("UDP close local socks connection")
 	socks.Close()
+	log.Printf("UDP close tunnel connection")
 	tun.Close()
+	log.Printf("UDP close udp binding socket")
 	clientBind.Close()
 	close(quitUDP)
 }
@@ -273,149 +283,6 @@ func TunnelClientUDP(req *gosocks.SocksRequest, socks *gosocks.SocksConn, tun ne
 	TunnelUDPAssociate(req, clientBind, clientAssociate, udpReq, clientAddr, socks, tun)
 }
 
-func TunnelClientUDP2(req *gosocks.SocksRequest, socks *gosocks.SocksConn, tun net.Conn) {
-	// bind local UDP
-	socksAddr := socks.LocalAddr().(*net.TCPAddr)
-	clientBind, err := net.ListenUDP("udp", &net.UDPAddr{IP: socksAddr.IP, Port: 0, Zone: socksAddr.Zone})
-	if err != nil {
-		log.Printf("error in binding local UDP: %s", err)
-		gosocks.ReplyGeneralFailure(socks, req)
-		socks.Close()
-		tun.Close()
-		return
-	}
-
-	// get local UDP address
-	bindAddr := clientBind.LocalAddr()
-	hostType, host, port := gosocks.NetAddrToSocksAddr(bindAddr)
-	log.Printf("UDP bind local address: %s", bindAddr.String())
-	socks.SetWriteDeadline(time.Now().Add(socks.Timeout))
-	_, err = gosocks.WriteSocksReply(socks, &gosocks.SocksReply{
-		Rep: gosocks.SocksSucceeded, HostType: hostType, BndHost: host, BndPort: port})
-	if err != nil {
-		log.Printf("error in sending reply: %s", err)
-		socks.Close()
-		clientBind.Close()
-		tun.Close()
-		return
-	}
-
-	// clientAssociate is used to validate datagrams received by clientBind
-	clientAssociate := gosocks.SocksAddrToNetAddr("udp", req.DstHost, req.DstPort).(*net.UDPAddr)
-
-	// send a request to tunnel, so that server-side knows this is a UDP-relay
-	h := "0.0.0.0"
-	if req.HostType == gosocks.SocksIPv6Host {
-		h = "::"
-	}
-	tun.SetWriteDeadline(time.Now().Add(socks.Timeout))
-	_, err = gosocks.WriteSocksRequest(tun, &gosocks.SocksRequest{
-		Cmd: req.Cmd, HostType: hostType, DstHost: h, DstPort: 0})
-	if err != nil {
-		log.Printf("error in tunnelling request: %s", err)
-		socks.Close()
-		clientBind.Close()
-		tun.Close()
-		return
-	}
-
-	// read reply from server-side
-	tun.SetReadDeadline(time.Now().Add(socks.Timeout))
-	reply, err := gosocks.ReadSocksReply(tun)
-	if err != nil {
-		log.Printf("error in reading reply from tunnel: %s", err)
-		socks.Close()
-		clientBind.Close()
-		tun.Close()
-		return
-	}
-	if reply.Rep != gosocks.SocksSucceeded {
-		log.Printf("error in reply from tunnel: 0x%02x", reply.Rep)
-		socks.Close()
-		clientBind.Close()
-		tun.Close()
-		return
-	}
-
-	// monitor socks TCP connection
-	quitTCP := make(chan bool)
-	go gosocks.ConnMonitor(socks, quitTCP)
-
-	quitUDP := make(chan bool)
-	// read UDP request from client
-	chClientUDP := make(chan *gosocks.UDPPacket)
-	go gosocks.UDPReader(clientBind, chClientUDP, quitUDP)
-
-	// read UDP request from tunnel
-	chTunnelDatagram := make(chan *datagramFrame)
-	go datagramFrameReader(tun, socks.Timeout, chTunnelDatagram, quitUDP)
-
-	clientAddr := clientAssociate
-
-loop:
-	for {
-		t := time.NewTimer(socks.Timeout)
-		select {
-		// packets from client, pack and send through tunnel
-		case pkt, ok := <-chClientUDP:
-			t.Stop()
-			if !ok {
-				break loop
-			}
-			// validation
-			// 1) RFC1928 Section-7
-			if !gosocks.LegalClientAddr(clientAssociate, pkt.Addr) {
-				continue
-			}
-			// 2) format
-			udpReq, err := gosocks.ParseUDPRequest(pkt.Data)
-			if err != nil {
-				log.Printf("error to parse UDP packet: %s", err)
-				break loop
-			}
-			// 3) no fragment
-			if udpReq.Frag != gosocks.SocksNoFragment {
-				continue
-			}
-			clientAddr = pkt.Addr
-			datagram := gosocks.PackUDPRequest(udpReq)
-			_, err = writeDatagramFrame(tun, &datagramFrame{uint16(len(datagram)), datagram}, socks.Timeout)
-			if err != nil {
-				log.Printf("error to write UDP to tunnel: %s", err)
-				break loop
-			}
-
-		// requests from tunnel, parse to UDP request, send to client
-		case frame, ok := <-chTunnelDatagram:
-			t.Stop()
-			if !ok {
-				break loop
-			}
-			_, err := clientBind.WriteToUDP(frame.datagram, clientAddr)
-			if err != nil {
-				log.Printf("error to send UDP packet to client: %s", err)
-				break loop
-			}
-
-		case <-quitTCP:
-			t.Stop()
-			log.Printf("UDP unexpected event from socks connection")
-			break loop
-
-		case <-t.C:
-			log.Printf("UDP timeout")
-			break loop
-		}
-		t.Stop()
-	}
-
-	// quit
-	socks.Close()
-	tun.Close()
-	clientBind.Close()
-	close(quitUDP)
-}
-
 func TunnelServer(tun net.Conn, socks *gosocks.SocksConn) {
 	tun.SetReadDeadline(time.Now().Add(socks.Timeout))
 	req, err := gosocks.ReadSocksRequest(tun)
@@ -427,9 +294,11 @@ func TunnelServer(tun net.Conn, socks *gosocks.SocksConn) {
 	}
 	switch req.Cmd {
 	case gosocks.SocksCmdConnect:
+		log.Printf("cmd connect")
 		TunnelTCP(req, tun, socks, socks.Timeout)
 		return
 	case gosocks.SocksCmdUDPAssociate:
+		log.Printf("cmd udp associate")
 		tunnelServerUDP(req, tun, socks)
 		return
 	case gosocks.SocksCmdBind:
@@ -502,11 +371,11 @@ func tunnelServerUDP(req *gosocks.SocksRequest, tun net.Conn, socks *gosocks.Soc
 
 	// read from local UDP
 	quitUDP := make(chan bool)
-	chSocksUDP := make(chan *gosocks.UDPPacket)
+	chSocksUDP := make(chan *gosocks.UDPPacket, 100)
 	go gosocks.UDPReader(socksUDP, chSocksUDP, quitUDP)
 
 	// read UDP request from tunnel
-	chTunnelDatagram := make(chan *datagramFrame)
+	chTunnelDatagram := make(chan *datagramFrame, 100)
 	go datagramFrameReader(tun, socks.Timeout, chTunnelDatagram, quitUDP)
 
 loop:
@@ -548,8 +417,11 @@ loop:
 	}
 
 	// quit
+	log.Printf("UDP close local socks connection")
 	socks.Close()
+	log.Printf("UDP close tunnel connection")
 	tun.Close()
+	log.Printf("UDP close udp binding socket")
 	socksUDP.Close()
 	close(quitUDP)
 }
