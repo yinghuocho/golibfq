@@ -48,10 +48,14 @@ func (ss *SocksSocksChain) UDPAssociate(req *gosocks.SocksRequest, src *gosocks.
 	}
 
 	// send request to forwarding socks connection
-	hostType, host, port := gosocks.NetAddrToSocksAddr(relayBind.LocalAddr())
+	hostType, _, _ := gosocks.NetAddrToSocksAddr(relayBind.LocalAddr())
+	h := "0.0.0.0"
+	if hostType == gosocks.SocksIPv6Host {
+		h = "::"
+	}
 	dst.SetWriteDeadline(time.Now().Add(dst.Timeout))
 	_, err = gosocks.WriteSocksRequest(dst, &gosocks.SocksRequest{
-		Cmd: req.Cmd, HostType: hostType, DstHost: host, DstPort: port})
+		Cmd: req.Cmd, HostType: hostType, DstHost: h, DstPort: 0})
 	if err != nil {
 		log.Printf("error in sending request to forwarding socks: %s", err)
 		src.Close()
@@ -135,7 +139,7 @@ loop:
 			}
 
 			clientAddr = pkt.Addr
-			_, err = relayBind.WriteToUDP(gosocks.PackUDPRequest(firstPkt), relayAddr)
+			_, err = relayBind.WriteToUDP(gosocks.PackUDPRequest(udpReq), relayAddr)
 			if err != nil {
 				log.Printf("error to relay UDP to forwarding socks: %s", err)
 				break loop
