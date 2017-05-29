@@ -20,7 +20,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
+	// "sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,7 +30,7 @@ import (
 const (
 	maxRequestSize = 0x10000
 	largeBufSize   = 0x10000
-	relayBufLimit  = 1024 * 1024
+	// relayBufLimit  = 0
 
 	// some constants copied from meek
 	// https://git.torproject.org/pluggable-transports/meek.git
@@ -74,15 +74,17 @@ func (df *DomainFrontingPollRequestGenerator) GenerateRequest(data []byte) (*htt
 type pollSession struct {
 	sessionID string
 
-	up    *utils.BytePipe
-	upCur []byte
+	// up    *utils.BytePipe
+	// upCur []byte
 
-	down *utils.BytePipe
+	// down *utils.BytePipe
+	pc net.Conn
+	ps net.Conn
 
-	readDeadline  time.Time
-	writeDeadline time.Time
+	// readDeadline  time.Time
+	// writeDeadline time.Time
 
-	quitFlag uint32
+	// quitFlag uint32
 }
 
 func genSessionID() string {
@@ -95,69 +97,86 @@ func genSessionID() string {
 }
 
 func (s *pollSession) Write(buf []byte) (int, error) {
-	copyed := make([]byte, len(buf))
-	copy(copyed, buf)
-	e := s.down.In(copyed, s.writeDeadline)
-	if e != nil {
-		return 0, e
-	} else {
-		return len(buf), nil
-	}
+	// copyed := make([]byte, len(buf))
+	// copy(copyed, buf)
+	// e := s.down.In(copyed, s.writeDeadline)
+	// if e != nil {
+	//	return 0, e
+	// } else {
+	// 	return len(buf), nil
+	// }
+	return s.pc.Write(buf)
 }
 
 func (s *pollSession) Read(buf []byte) (n int, err error) {
-	if len(s.upCur) == 0 {
-		s.upCur, err = s.up.Out(s.readDeadline)
-		if err != nil {
-			return
-		}
-	}
-	n = copy(buf, s.upCur)
-	s.upCur = s.upCur[n:]
-	return
+	// if len(s.upCur) == 0 {
+	//	s.upCur, err = s.up.Out(s.readDeadline)
+	//	if err != nil {
+	//		return
+	//	}
+	// }
+	// n = copy(buf, s.upCur)
+	// s.upCur = s.upCur[n:]
+	// return
+	return s.pc.Read(buf)
 }
 
 func (s *pollSession) LocalAddr() net.Addr {
-	return nil
+	// return nil
+	return s.pc.LocalAddr()
 }
 
 func (s *pollSession) RemoteAddr() net.Addr {
-	return nil
+	// return nil
+	return s.pc.RemoteAddr()
 }
 
 func (s *pollSession) SetDeadline(t time.Time) error {
-	err := s.SetReadDeadline(t)
-	if err != nil {
-		return err
+	// err := s.SetReadDeadline(t)
+	// if err != nil {
+	//	return err
+	// }
+	// err = s.SetWriteDeadline(t)
+	// if err != nil {
+	//	return err
+	// }
+	// return nil
+	e := s.pc.SetReadDeadline(t)
+	if e != nil {
+		return e
 	}
-	err = s.SetWriteDeadline(t)
-	if err != nil {
-		return err
+	e = s.pc.SetWriteDeadline(t)
+	if e != nil {
+		return e
 	}
 	return nil
 }
 
 func (s *pollSession) SetReadDeadline(t time.Time) error {
-	s.readDeadline = t
-	return nil
+	// s.readDeadline = t
+	// return nil
+	return s.pc.SetReadDeadline(t)
 }
 
 func (s *pollSession) SetWriteDeadline(t time.Time) error {
-	s.writeDeadline = t
-	return nil
+	// s.writeDeadline = t
+	// return nil
+	return s.pc.SetWriteDeadline(t)
 }
 
 func (s *pollSession) Close() error {
-	if atomic.AddUint32(&s.quitFlag, 1) <= 1 {
-		s.up.Stop()
-		s.down.Stop()
-	}
+	// if atomic.AddUint32(&s.quitFlag, 1) <= 1 {
+	// s.up.Stop()
+	// s.down.Stop()
+	// }
+	// return nil
+	s.pc.Close()
 	return nil
 }
 
-func (s *pollSession) isClosed() bool {
-	return atomic.LoadUint32(&s.quitFlag) > 0
-}
+// func (s *pollSession) isClosed() bool {
+//	return atomic.LoadUint32(&s.quitFlag) > 0
+// }
 
 type ClosableRoundTripper interface {
 	http.RoundTripper
@@ -316,7 +335,8 @@ func sendRecv(rt http.RoundTripper, req *http.Request, rawBody []byte) (resp *ht
 	return
 }
 
-func readResponse(resp *http.Response, pipe *utils.BytePipe) (int, error) {
+// func readResponse(resp *http.Response, pipe *utils.BytePipe) (int, error) {
+func readResponse(resp *http.Response, c net.Conn) (int, error) {
 	var buf [largeBufSize]byte
 	var err error
 	var total int = 0
@@ -329,11 +349,12 @@ func readResponse(resp *http.Response, pipe *utils.BytePipe) (int, error) {
 	for {
 		n, err = resp.Body.Read(buf[:])
 		if n > 0 {
-			b := make([]byte, n)
-			copy(b, buf[:n])
-			e := pipe.In(b, time.Time{})
+			// b := make([]byte, n)
+			// copy(b, buf[:n])
+			// e := pipe.In(b, time.Time{})
+			_, e := c.Write(buf[:n])
 			if e != nil {
-				return total, io.ErrClosedPipe
+				return total, e
 			} else {
 				total += n
 			}
@@ -414,18 +435,12 @@ func (ch *pollSessionClientHandler) pollLoop() {
 
 loop:
 	for {
-		if ch.session.isClosed() {
-			resp, _ := ch.roundTrip(ch.transport, nil, map[string]string{"X-Session-Ctrl": "FIN"})
-			if resp != nil {
-				io.Copy(ioutil.Discard, resp.Body)
-				resp.Body.Close()
-			}
-			break loop
-		}
 		var buffer [maxRequestSize]byte
-		n, err := ch.session.down.OutToBuf(buffer[:], clientTurnaroundTimeout, time.Now().Add(interval))
+		// n, err := ch.session.down.OutToBuf(buffer[:], clientTurnaroundTimeout, time.Now().Add(interval))
+		ch.session.ps.SetReadDeadline(time.Now().Add(interval))
+		n, e := ch.session.ps.Read(buffer[:])
 		// data, err := ch.session.down.Out(time.Now().Add(interval))
-		if err == io.EOF {
+		if e == io.EOF {
 			resp, _ := ch.roundTrip(ch.transport, nil, map[string]string{"X-Session-Ctrl": "FIN"})
 			if resp != nil {
 				io.Copy(ioutil.Discard, resp.Body)
@@ -437,7 +452,7 @@ loop:
 		if err != nil {
 			break loop
 		}
-		rbytes, err := readResponse(resp, ch.session.up)
+		rbytes, err := readResponse(resp, ch.session.ps)
 		if err != nil {
 			break loop
 		}
@@ -447,40 +462,6 @@ loop:
 			ch.transport.Close()
 		}
 
-		// total := len(data)
-		// sent := 0
-		// rbytes := 0
-		// inner:
-		// for {
-		//	n := total - sent
-		//	var chunk []byte
-		//	switch {
-		//	case n == 0:
-		//		chunk = nil
-		//	case n > maxRequestSize:
-		//		n = maxRequestSize
-		//		chunk = data[sent : sent+n]
-		//	default:
-		//		chunk = data[sent : sent+n]
-		//	}
-		//	resp, err := ch.roundTrip(ch.transport, chunk, nil)
-		//	if err != nil {
-		//		break loop
-		//	}
-		//	rbytes, err = readResponse(resp, ch.session.up)
-		//	if err != nil {
-		//		break loop
-		//	}
-		//	if resp.Close {
-		//		// server said the underlying connection should be closed
-		//		log.Printf("pollLoop: Transport received Close signal from server")
-		//		ch.transport.Close()
-		//	}
-		//	if chunk == nil {
-		//		break inner
-		//	}
-		//	sent += n
-		// }
 		if rbytes > 0 {
 			interval = clientTurnaroundTimeout
 		} else if interval == 0 {
@@ -492,7 +473,7 @@ loop:
 			interval = maxPollInterval
 		}
 	}
-	ch.session.Close()
+	ch.session.ps.Close()
 	ch.transport.Close()
 }
 
@@ -505,7 +486,7 @@ loop:
 			break loop
 		}
 		// n, err := readResponse(resp, ch.session.up)
-		_, err = readResponse(resp, ch.session.up)
+		_, err = readResponse(resp, ch.session.ps)
 		if err != nil {
 			log.Printf("duplexRecvLoop: error readResponse: %s", err)
 			break loop
@@ -517,7 +498,7 @@ loop:
 			ch.recvTransport.Close()
 		}
 	}
-	ch.session.Close()
+	ch.session.ps.Close()
 	ch.recvTransport.Close()
 }
 
@@ -525,17 +506,12 @@ func (ch *pollSessionClientHandler) duplexSendLoop() {
 	txcnt := 0
 loop:
 	for {
-		if ch.session.isClosed() {
-			resp, _ := ch.roundTrip(ch.sendTransport, nil, map[string]string{"X-Session-Ctrl": "FIN"})
-			if resp != nil {
-				resp.Body.Close()
-			}
-			break loop
-		}
 		var buffer [maxRequestSize]byte
-		n, err := ch.session.down.OutToBuf(buffer[:], clientTurnaroundTimeout, time.Time{})
+		ch.session.ps.SetReadDeadline(time.Time{})
+		n, e := ch.session.ps.Read(buffer[:])
+		// n, err := ch.session.down.OutToBuf(buffer[:], clientTurnaroundTimeout, time.Time{})
 		// data, err := ch.session.down.Out(time.Time{})
-		if err == io.EOF {
+		if e == io.EOF {
 			log.Printf("duplexSendLoop: outbound stream closed")
 			resp, _ := ch.roundTrip(ch.sendTransport, nil, map[string]string{"X-Session-Ctrl": "FIN"})
 			if resp != nil {
@@ -560,52 +536,22 @@ loop:
 				txcnt = 0
 			}
 		}
-		// total := len(data)
-		// sent := 0
-		// inner:
-		// for {
-		//	var chunk []byte
-		//	n := total - sent
-		//	switch {
-		//	case n == 0:
-		//		break inner
-		//	case n > maxRequestSize:
-		//		n = maxRequestSize
-		//		chunk = data[sent : sent+n]
-		//	default:
-		//		chunk = data[sent : sent+n]
-		//	}
-		//	resp, err := ch.roundTrip(ch.sendTransport, chunk, nil)
-		//	if err != nil {
-		//		log.Printf("duplexSendLoop error: %s", err)
-		//		ch.session.Close()
-		//		break inner
-		//	}
-		//	io.Copy(ioutil.Discard, resp.Body)
-		//	resp.Body.Close()
-		//	txcnt += 1
-		//	log.Printf("duplexSendLoop: sent %d requests, %d bytes in this connection", txcnt, n)
-		//	if resp.Close {
-		// server said the underlying connection should be closed
-		//		log.Printf("duplexSendLoop: Transport received Close signal from server")
-		//		ch.sendTransport.Close()
-		//		txcnt = 0
-		//	}
-		//	sent += n
-		// }
 	}
-	ch.session.Close()
+	ch.session.ps.Close()
 	ch.sendTransport.Close()
 }
 
 func newPollSession(sessionID string) *pollSession {
+	pc, ps := utils.SocketPipe()
 	s := &pollSession{
 		sessionID: sessionID,
-		up:        utils.NewBytePipe(sessionID+"-UP", relayBufLimit),
-		down:      utils.NewBytePipe(sessionID+"-DOWN", relayBufLimit),
+		// up:        utils.NewBytePipe(sessionID+"-UP", relayBufLimit),
+		// down:      utils.NewBytePipe(sessionID+"-DOWN", relayBufLimit),
+		pc: pc,
+		ps: ps,
 	}
-	go s.up.Start()
-	go s.down.Start()
+	// go s.up.Start()
+	// go s.down.Start()
 	return s
 }
 
@@ -689,7 +635,7 @@ func (m *pollSessionManager) closeSession(sessionID string) {
 	session, ok := m.sessionMap[sessionID]
 	if ok {
 		delete(m.sessionMap, sessionID)
-		session.Close()
+		session.ps.Close()
 	}
 	log.Printf("close session: %s", sessionID)
 }
@@ -712,7 +658,7 @@ func (m *pollSessionManager) expireSessions() {
 			if session.isExpired() {
 				log.Printf("session expired %s", sessionID)
 				delete(m.sessionMap, sessionID)
-				session.Close()
+				session.ps.Close()
 			}
 		}
 		log.Printf("alive sessions: %d", len(m.sessionMap))
@@ -828,7 +774,8 @@ func (sh *PollServerHandler) processDuplexRequest(session *pollSession, w http.R
 		}
 
 		if len(data) > 0 {
-			session.up.In(data, time.Time{})
+			session.ps.SetWriteDeadline(time.Time{})
+			session.ps.Write(data)
 		}
 		w.Write([]byte(""))
 		return
@@ -838,6 +785,7 @@ func (sh *PollServerHandler) processDuplexRequest(session *pollSession, w http.R
 func (sh *PollServerHandler) processDuplexRecv(session *pollSession, w http.ResponseWriter, req *http.Request) {
 	start := false
 	hardDeadline := time.Now().Add(maxDuplexRecvTimeout)
+	var buf [largeBufSize]byte
 loop:
 	for {
 		softDeadline := time.Now().Add(serverTurnaroundTimeout)
@@ -845,19 +793,21 @@ loop:
 		if softDeadline.After(hardDeadline) || !start {
 			deadline = hardDeadline
 		}
-		data, err := session.down.Out(deadline)
-		if err != nil {
+		// data, err := session.down.Out(deadline)
+		session.ps.SetReadDeadline(deadline)
+		n, e := session.ps.Read(buf[:])
+		if e != nil {
 			// write("") to flush chunks bufferred by CDNs
 			w.Write([]byte(""))
-			if err == io.EOF {
+			if e == io.EOF {
 				sh.m.closeSession(session.sessionID)
 			}
 			break loop
 		}
-		n, err := w.Write(data)
+		_, e = w.Write(buf[:n])
 		start = true
-		if err != nil {
-			log.Println(n, err)
+		if e != nil {
+			log.Println(n, e)
 		}
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
@@ -866,7 +816,8 @@ loop:
 }
 
 func (sh *PollServerHandler) processRequest(session *pollSession, w http.ResponseWriter, req *http.Request) {
-	// read data from request, send to inboundArriving channel
+	var buf [largeBufSize]byte
+
 	body := http.MaxBytesReader(w, req.Body, maxRequestSize)
 	data, e := ioutil.ReadAll(body)
 	if e != nil && e != io.EOF {
@@ -875,7 +826,9 @@ func (sh *PollServerHandler) processRequest(session *pollSession, w http.Respons
 		return
 	}
 	if len(data) > 0 {
-		session.up.In(data, time.Time{})
+		// session.up.In(data, time.Time{})
+		session.ps.SetWriteDeadline(time.Time{})
+		session.ps.Write(data)
 	}
 	hardDeadline := time.Now().Add(serverMaxTurnaroundTimeout)
 	for {
@@ -884,15 +837,17 @@ func (sh *PollServerHandler) processRequest(session *pollSession, w http.Respons
 		if softDeadline.After(hardDeadline) {
 			deadline = hardDeadline
 		}
-		data, err := session.down.Out(deadline)
-		if err != nil {
+		// data, err := session.down.Out(deadline)
+		session.ps.SetReadDeadline(deadline)
+		n, e := session.ps.Read(buf[:])
+		if e != nil {
 			w.Write([]byte(""))
-			if err == io.EOF {
+			if e == io.EOF {
 				sh.m.closeSession(session.sessionID)
 			}
 			return
 		}
-		w.Write(data)
+		w.Write(buf[:n])
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
