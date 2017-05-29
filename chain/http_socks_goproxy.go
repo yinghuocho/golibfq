@@ -3,7 +3,7 @@ package chain
 import (
 	"net"
 	"net/http"
-	
+
 	"github.com/elazarl/goproxy"
 )
 

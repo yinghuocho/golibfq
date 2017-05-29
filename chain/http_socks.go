@@ -7,13 +7,99 @@ import (
 	"net/http"
 	"strconv"
 	"time"
-	
+
 	"github.com/yinghuocho/gosocks"
 )
 
 type HTTPSocksChain struct {
 	SocksDialer *gosocks.SocksDialer
 	SocksAddr   string
+}
+
+type HTTPtoSocks struct {
+	Chain HTTPSocksChain
+}
+
+func (hts *HTTPtoSocks) Serve(l net.Listener) error {
+	defer l.Close()
+
+	var tempDelay time.Duration
+	for {
+		conn, e := l.Accept()
+		if e != nil {
+			if ne, ok := e.(net.Error); ok && ne.Temporary() {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if max := 1 * time.Second; tempDelay > max {
+					tempDelay = max
+				}
+				time.Sleep(tempDelay)
+				continue
+			} else {
+				return e
+			}
+		}
+		tempDelay = 0
+		go hts.serve(conn)
+	}
+}
+
+func (hts *HTTPtoSocks) serve(c net.Conn) {
+	c.SetReadDeadline(time.Now().Add(hts.Chain.SocksDialer.Timeout))
+	r := bufio.NewReader(c)
+	req, e := http.ReadRequest(r)
+	if e != nil {
+		c.Close()
+		return
+	}
+	socksConn, e := hts.Chain.dial(req)
+	if e != nil {
+		resp := &http.Response{
+			StatusCode: 502,
+			Status:     "502 Bad Gateway",
+			Proto:      req.Proto,
+			ProtoMajor: req.ProtoMajor,
+			ProtoMinor: req.ProtoMinor,
+		}
+		resp.Write(c)
+		c.Close()
+		return
+	}
+
+	if req.Method == "CONNECT" {
+		resp := &http.Response{
+			StatusCode: 200,
+			Status:     "200 OK",
+			Proto:      req.Proto,
+			ProtoMajor: req.ProtoMajor,
+			ProtoMinor: req.ProtoMinor,
+		}
+		e = resp.Write(c)
+		if e != nil {
+			c.Close()
+			socksConn.Close()
+			return
+		}
+	} else {
+		e = req.Write(socksConn)
+		if e != nil {
+			resp := &http.Response{
+				StatusCode: 502,
+				Status:     "502 Bad Gateway",
+				Proto:      req.Proto,
+				ProtoMajor: req.ProtoMajor,
+				ProtoMinor: req.ProtoMinor,
+			}
+			resp.Write(c)
+			socksConn.Close()
+			c.Close()
+			return
+		}
+	}
+	gosocks.CopyLoopTimeout(c, socksConn, hts.Chain.SocksDialer.Timeout)
 }
 
 func hostPort(req *http.Request) (string, string) {
