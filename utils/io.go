@@ -4,9 +4,81 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"syscall"
 	"time"
 )
+
+var (
+	lock sync.Mutex
+
+	pipeListener *net.TCPListener
+	pipeCnt      int
+	pipeCh       chan *net.TCPConn
+)
+
+type pipeConn struct {
+	id     int
+	closed bool
+	net.Conn
+}
+
+func (pc *pipeConn) Close() error {
+	lock.Lock()
+	defer lock.Unlock()
+	if pc.closed {
+		return nil
+	}
+
+	pipeCnt -= 1
+	if pipeCnt == 0 {
+		pipeListener.Close()
+		close(pipeCh)
+		pipeListener = nil
+	}
+	log.Printf("SocketPipe %d Close: pipe socket connections: %d", pc.id, pipeCnt)
+	pc.closed = true
+	return pc.Conn.Close()
+}
+
+func servePipe(l *net.TCPListener) {
+	go func() {
+		log.Printf("pipe listener starts")
+		for {
+			c, e := l.AcceptTCP()
+			if e != nil {
+				break
+			}
+			pipeCh <- c
+		}
+		log.Printf("pipe listener ends")
+	}()
+}
+
+func SocketPipe() (net.Conn, net.Conn) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	var e error
+	if pipeCnt == 0 {
+		pipeListener, e = net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+		if e != nil {
+			return nil, nil
+		}
+		pipeCh = make(chan *net.TCPConn)
+		servePipe(pipeListener)
+	}
+	c, e := net.DialTCP("tcp", nil, pipeListener.Addr().(*net.TCPAddr))
+	if e != nil {
+		return nil, nil
+	}
+	s := <-pipeCh
+	pc := &pipeConn{closed: false, id: pipeCnt, Conn: c}
+	ps := &pipeConn{closed: false, id: pipeCnt + 1, Conn: s}
+	pipeCnt += 2
+	log.Printf("SocketPipe Create: pipe socket connections: %d", pipeCnt)
+	return pc, ps
+}
 
 type BytePipe struct {
 	id      string
