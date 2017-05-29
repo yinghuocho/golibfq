@@ -2,12 +2,10 @@ package mux
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
 	"net"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/yinghuocho/golibfq/utils"
@@ -68,38 +66,19 @@ type Stream struct {
 	// checked by Write to ensure first data from Client Stream has a SYN flag.
 	synSent bool
 
-	up    *utils.BytePipe
-	upCur []byte
+	pc net.Conn
+	ps net.Conn
+	// up    *utils.BytePipe
+	// upCur []byte
 
-	readDeadline  time.Time
+	// readDeadline  time.Time
 	writeDeadline time.Time
+	closed        bool
 
-	quit     chan bool
-	quitFlag uint32
+	// quit     chan bool
+	// quitFlag uint32
 
 	session *Session
-}
-
-var (
-	framePool *sync.Pool = &sync.Pool{
-		New: func() interface{} {
-			return &muxFrame{}
-		},
-	}
-)
-
-func newFrame(sID uint32, flag byte, dataLen uint16, data []byte) *muxFrame {
-	f := framePool.Get().(*muxFrame)
-	f.sID = sID
-	f.flag = flag
-	f.dataLen = dataLen
-	f.data = data
-	return f
-}
-
-func releaseFrame(f *muxFrame) {
-	f.data = nil
-	framePool.Put(f)
 }
 
 func NewClient(c net.Conn) *Client {
@@ -170,13 +149,13 @@ func (s *Session) readFrame() (*muxFrame, error) {
 		if err != nil {
 			return nil, err
 		}
-		return newFrame(sID, flag, dataLen, data), nil
+		return &muxFrame{sID, flag, dataLen, data}, nil
 	} else {
-		return newFrame(sID, flag, dataLen, nil), nil
+		return &muxFrame{sID, flag, dataLen, nil}, nil
 	}
 }
 
-func (s *Session) writeFrame(frame *muxFrame) error {
+func (s *Session) writeFrame(frame *muxFrame, deadline time.Time) error {
 	s.wlock.Lock()
 	defer s.wlock.Unlock()
 
@@ -187,7 +166,9 @@ func (s *Session) writeFrame(frame *muxFrame) error {
 	if frame.dataLen > 0 {
 		copy(buf[7:], frame.data[0:frame.dataLen])
 	}
+	s.conn.SetWriteDeadline(deadline)
 	_, err := s.conn.Write(buf[0 : uint32(frame.dataLen)+7])
+	// log.Printf("frame send: %d %d %d: error(%v)", frame.sID, frame.flag, frame.dataLen, err)
 	return err
 }
 
@@ -206,15 +187,20 @@ func (s *Session) newStream(sID uint32) (*Stream, error) {
 	if s.streams == nil {
 		return nil, io.EOF
 	}
+	pc, ps := utils.SocketPipe()
 	stream := &Stream{
-		id:      sID,
-		up:      utils.NewBytePipe(fmt.Sprintf("%d-UP", sID), 0),
-		quit:    make(chan bool),
-		session: s,
+		id: sID,
+		// up:      utils.NewBytePipe(fmt.Sprintf("%d-UP", sID), 0),
+		// quit:    make(chan bool),
+		pc:            pc,
+		ps:            ps,
+		writeDeadline: time.Time{},
+		closed:        false,
+		session:       s,
 	}
 
 	s.streams[sID] = stream
-	go stream.up.Start()
+	// go stream.up.Start()
 	return stream, nil
 }
 
@@ -274,6 +260,7 @@ loop:
 		case f := <-readCh:
 			stream := s.getStream(f.sID)
 			// SYN
+			// log.Printf("frame recv: %d %d %d", f.sID, f.flag, f.dataLen)
 			if (stream == nil) && (f.flag&SYN != 0) {
 				stream, _ = s.newStream(f.sID)
 				if !s.isClient {
@@ -284,12 +271,16 @@ loop:
 			// DATA
 			if (f.flag&DATA != 0) && (f.dataLen > 0) {
 				if stream != nil {
-					stream.up.In(f.data, time.Time{})
+					// stream.up.In(f.data, time.Time{})
+					stream.ps.SetWriteDeadline(time.Time{})
+					_, e := stream.ps.Write(f.data)
+					if e != nil {
+						stream.cloze()
+					}
 				} else {
 					// unsolicited frame, respond with RST
-					rst := newFrame(f.sID, RST, 0, nil)
-					s.writeFrame(rst)
-					releaseFrame(rst)
+					rst := &muxFrame{f.sID, RST, 0, nil}
+					s.writeFrame(rst, time.Time{})
 				}
 			}
 
@@ -300,7 +291,6 @@ loop:
 					stream.cloze()
 				}
 			}
-			releaseFrame(f)
 
 		case <-s.quit:
 			// quit message needs to broadcast to all streams.
@@ -333,89 +323,126 @@ func (s *Session) localAddr() net.Addr {
 }
 
 func (m *Stream) Read(buf []byte) (n int, err error) {
-	if len(m.upCur) == 0 {
-		m.upCur, err = m.up.Out(m.readDeadline)
-		if err != nil {
-			return
-		}
-	}
-	n = copy(buf, m.upCur)
-	m.upCur = m.upCur[n:]
-	return
+	// if len(m.upCur) == 0 {
+	//	m.upCur, err = m.up.Out(m.readDeadline)
+	//	if err != nil {
+	//		return
+	//	}
+	// }
+	// n = copy(buf, m.upCur)
+	// m.upCur = m.upCur[n:]
+	// return
+	return m.pc.Read(buf)
 }
 
 func (m *Stream) Write(b []byte) (int, error) {
-	var timeout <-chan time.Time
-	if !m.writeDeadline.IsZero() {
-		t := time.NewTimer(m.writeDeadline.Sub(time.Now()))
-		defer t.Stop()
-		timeout = t.C
-	}
-
-	sent := 0
 	total := len(b)
-loop:
+	sent := 0
 	for {
-		select {
-		case <-m.session.quit:
-			return sent, &net.OpError{Op: "write", Err: syscall.EPIPE}
-		case <-m.quit:
-			return sent, &net.OpError{Op: "write", Err: syscall.EPIPE}
-		case <-timeout:
-			return sent, &utils.TimeoutError{}
-		default:
-			n := total - sent
-			if n <= 0 {
-				break loop
-			}
-			if n > maxDataLen {
-				n = maxDataLen
-			}
-			f := newFrame(m.id, DATA, uint16(n), b[sent:sent+n])
-			if !m.synSent && m.session.isClient {
-				f.flag |= SYN
-				m.synSent = true
-			}
-			err := m.session.writeFrame(f)
-			if err != nil {
-				return sent, err
-			}
-			releaseFrame(f)
-			sent += n
+		n := total - sent
+		if n == 0 {
+			break
 		}
+		if n > maxDataLen {
+			n = maxDataLen
+		}
+		f := &muxFrame{m.id, DATA, uint16(n), b[sent : sent+n]}
+		if !m.synSent && m.session.isClient {
+			f.flag |= SYN
+			m.synSent = true
+		}
+		err := m.session.writeFrame(f, m.writeDeadline)
+		if err != nil {
+			return sent, err
+		}
+		sent += n
 	}
 	return total, nil
+
+	// var timeout <-chan time.Time
+	// if !m.writeDeadline.IsZero() {
+	//	t := time.NewTimer(m.writeDeadline.Sub(time.Now()))
+	//	defer t.Stop()
+	//	timeout = t.C
+	// }
+
+	// sent := 0
+	// total := len(b)
+	// loop:
+	// for {
+	//	select {
+	//	case <-m.session.quit:
+	//		return sent, &net.OpError{Op: "write", Err: syscall.EPIPE}
+	//	case <-m.quit:
+	//		return sent, &net.OpError{Op: "write", Err: syscall.EPIPE}
+	//	case <-timeout:
+	//		return sent, &utils.TimeoutError{}
+	//	default:
+	//		n := total - sent
+	//		if n <= 0 {
+	//			break loop
+	//		}
+	//		if n > maxDataLen {
+	//			n = maxDataLen
+	//		}
+	//		f := newFrame(m.id, DATA, uint16(n), b[sent:sent+n])
+	//		if !m.synSent && m.session.isClient {
+	//			f.flag |= SYN
+	//			m.synSent = true
+	//		}
+	//		err := m.session.writeFrame(f)
+	//		if err != nil {
+	//			return sent, err
+	//		}
+	//		releaseFrame(f)
+	//		sent += n
+	//	}
+	// }
+	// return total, nil
 }
 
 func (m *Stream) Close() error {
-	m.session.clearStream(m.id)
-	if m.cloze() {
-		fin := newFrame(m.id, FIN, 0, nil)
-		select {
-		case <-m.session.quit:
-		default:
-			m.session.writeFrame(fin)
-		}
-		releaseFrame(fin)
+	if m.closed {
+		return nil
 	}
-	return nil
+	m.closed = true
+	fin := &muxFrame{m.id, FIN, 0, nil}
+	m.session.writeFrame(fin, m.writeDeadline)
+	m.session.clearStream(m.id)
+	m.pc.Close()
+	return m.ps.Close()
+
+	// m.session.clearStream(m.id)
+	// if m.cloze() {
+	//	fin := newFrame(m.id, FIN, 0, nil)
+	//	select {
+	//	case <-m.session.quit:
+	//	default:
+	//		m.session.writeFrame(fin)
+	//	}
+	//	releaseFrame(fin)
+	// }
+	// return nil
+	// return m.pc.Close()
 }
 
-func (m *Stream) cloze() bool {
-	if atomic.AddUint32(&m.quitFlag, 1) > 1 {
-		return false
-	}
-	close(m.quit)
-	m.up.Stop()
-	return true
+func (m *Stream) cloze() {
+	// if atomic.AddUint32(&m.quitFlag, 1) > 1 {
+	//	return false
+	// }
+	// close(m.quit)
+	// m.up.Stop()
+
+	// return true
+	m.ps.Close()
 }
 
 func (m *Stream) SetDeadline(t time.Time) error {
-	err := m.SetReadDeadline(t)
+	err := m.pc.SetReadDeadline(t)
 	if err != nil {
 		return err
 	}
-	err = m.SetWriteDeadline(t)
+	err = m.pc.SetWriteDeadline(t)
 	if err != nil {
 		return err
 	}
@@ -423,13 +450,13 @@ func (m *Stream) SetDeadline(t time.Time) error {
 }
 
 func (m *Stream) SetReadDeadline(t time.Time) error {
-	m.readDeadline = t
-	return nil
+	return m.pc.SetReadDeadline(t)
 }
 
 func (m *Stream) SetWriteDeadline(t time.Time) error {
 	m.writeDeadline = t
 	return nil
+	// return m.pc.SetWriteDeadline(t)
 }
 
 func (m *Stream) RemoteAddr() net.Addr {
