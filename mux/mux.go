@@ -2,7 +2,9 @@ package mux
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -187,7 +189,10 @@ func (s *Session) newStream(sID uint32) (*Stream, error) {
 	if s.streams == nil {
 		return nil, io.EOF
 	}
-	pc, ps := utils.SocketPipe()
+	pc, ps := utils.CreatePipe()
+	if pc == nil || ps == nil {
+		return nil, errors.New("CreatePipe fail")
+	}
 	stream := &Stream{
 		id: sID,
 		// up:      utils.NewBytePipe(fmt.Sprintf("%d-UP", sID), 0),
@@ -235,6 +240,7 @@ loop:
 		var curStream *Stream
 		var timer *time.Timer
 		var to <-chan time.Time
+		var e error
 
 		if s.idle != 0 {
 			timer = time.NewTimer(s.idle)
@@ -259,12 +265,18 @@ loop:
 			pendingStream = pendingStream[1:]
 		case f := <-readCh:
 			stream := s.getStream(f.sID)
-			// SYN
+			// SYN, only server-side should receive SYN
 			// log.Printf("frame recv: %d %d %d", f.sID, f.flag, f.dataLen)
 			if (stream == nil) && (f.flag&SYN != 0) {
-				stream, _ = s.newStream(f.sID)
-				if !s.isClient {
+				stream, e = s.newStream(f.sID)
+				if e != nil {
+					log.Printf("fail to start new stream: %s", e)
+					rst := &muxFrame{f.sID, RST, 0, nil}
+					s.writeFrame(rst, time.Time{})
+				} else {
+					// if !s.isClient {
 					pendingStream = append(pendingStream, stream)
+					// }
 				}
 			}
 

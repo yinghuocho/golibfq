@@ -542,7 +542,7 @@ loop:
 }
 
 func newPollSession(sessionID string) *pollSession {
-	pc, ps := utils.SocketPipe()
+	pc, ps := utils.CreatePipe()
 	s := &pollSession{
 		sessionID: sessionID,
 		// up:        utils.NewBytePipe(sessionID+"-UP", relayBufLimit),
